@@ -1832,42 +1832,6 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         return {"action": "continue"}
 
     @HookHandler(
-        "maisaka.reply.before_post_process",
-        name="smart_segmentation_preserve_prepared_response",
-        description="预分段成功后跳过宿主文本改写，保证发送链能按原文哈希命中缓存",
-    )
-    async def handle_maisaka_reply_before_post_process(
-        self,
-        response: str = "",
-        session_id: str = "",
-        reply_message_id: str = "",
-        reply_tool_args: dict[str, Any] | None = None,
-        skip_post_process: bool = False,
-        enable_splitter: bool = True,
-        enable_chinese_typo: bool = True,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """只在精确命中预分段缓存时关闭本次宿主文本后处理。"""
-        if not _has_prepared_segments(session_id, response):
-            return {"action": "continue"}
-        modified_kwargs = dict(kwargs)
-        modified_kwargs.update(
-            {
-                "response": response,
-                "session_id": session_id,
-                "reply_message_id": reply_message_id,
-                "reply_tool_args": dict(reply_tool_args or {}),
-                "skip_post_process": True,
-                "enable_splitter": bool(enable_splitter),
-                "enable_chinese_typo": bool(enable_chinese_typo),
-            }
-        )
-        return {
-            "action": "continue",
-            "modified_kwargs": modified_kwargs,
-        }
-
-    @HookHandler(
         "maisaka.planner.before_request",
         name="smart_segmentation_wait_before_planner",
         description="等待同流分段全部发送并同步历史，再修补可能提前构建的 planner prompt",

@@ -1,14 +1,20 @@
 import asyncio
 import json
 import random
+import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+_plugin_path = Path(__file__).resolve().parents[1] / "plugin.py"
+_plugin_spec = importlib.util.spec_from_file_location("smart_segmentation_plugin", _plugin_path)
+if _plugin_spec is None or _plugin_spec.loader is None:
+    raise RuntimeError(f"无法加载插件模块: {_plugin_path}")
+plugin_module = importlib.util.module_from_spec(_plugin_spec)
+sys.modules[_plugin_spec.name] = plugin_module
+_plugin_spec.loader.exec_module(plugin_module)
 
-from plugins.smart_segmentation_plugin import plugin as plugin_module
-from plugins.smart_segmentation_plugin.plugin import (
+from smart_segmentation_plugin import (  # noqa: E402
     _COMMAND_REPLY_GRACE_SECONDS,
     PluginSectionConfig,
     SegmentationSectionConfig,
@@ -123,7 +129,6 @@ def test_get_components_registers_hook_handlers_for_current_host() -> None:
     assert hook_components["smart_segmentation_command_scope_enter"]["metadata"]["hook"] == "chat.command.before_execute"
     assert "smart_segmentation_command_scope_leave" in hook_components
     assert hook_components["smart_segmentation_command_scope_leave"]["metadata"]["hook"] == "chat.command.after_execute"
-    # 早期路径是唯一的分段入口；没有这个 hook，发送链上的缓存查找永远 miss，插件等于失效。
     assert "smart_segmentation_after_replyer_response" in hook_components
     assert (
         hook_components["smart_segmentation_after_replyer_response"]["metadata"]["hook"]
@@ -132,11 +137,7 @@ def test_get_components_registers_hook_handlers_for_current_host() -> None:
     replyer_hook_timeout_ms = hook_components["smart_segmentation_after_replyer_response"]["metadata"]["timeout_ms"]
     assert replyer_hook_timeout_ms == 25_000
     assert replyer_hook_timeout_ms > plugin_module._REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS * 1000
-    assert "smart_segmentation_preserve_prepared_response" in hook_components
-    assert (
-        hook_components["smart_segmentation_preserve_prepared_response"]["metadata"]["hook"]
-        == "maisaka.reply.before_post_process"
-    )
+    assert "smart_segmentation_preserve_prepared_response" not in hook_components
 
 
 def test_runtime_settings_use_one_config_snapshot_and_respect_configured_segment_count() -> None:
