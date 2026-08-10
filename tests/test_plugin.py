@@ -135,8 +135,9 @@ def test_get_components_registers_hook_handlers_for_current_host() -> None:
         == "maisaka.replyer.after_response"
     )
     replyer_hook_timeout_ms = hook_components["smart_segmentation_after_replyer_response"]["metadata"]["timeout_ms"]
-    assert replyer_hook_timeout_ms == 25_000
+    assert replyer_hook_timeout_ms == 45_000
     assert replyer_hook_timeout_ms > plugin_module._REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS * 1000
+    assert plugin_module._REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS == 40.0
     assert "smart_segmentation_preserve_prepared_response" not in hook_components
 
 

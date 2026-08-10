@@ -65,7 +65,7 @@ await self.ctx.send.text(
 
 | Hook | mode | 作用 |
 | --- | --- | --- |
-| `maisaka.replyer.after_response` | `BLOCKING` | 在 25 秒 handler 窗口内预分段，合法的 JSON 数组结果写入 `_prepared_segment_registry`。 |
+| `maisaka.replyer.after_response` | `BLOCKING` | 在 45 秒 handler 窗口内预分段，合法的 JSON 数组结果写入 `_prepared_segment_registry`。 |
 | `maisaka.reply.before_post_process` | `BLOCKING` | 精确命中预分段缓存时跳过本次宿主文本后处理，避免出站文本变化导致缓存失配。 |
 | `send_service.after_build_message` | `BLOCKING` | 消费缓存，把出站消息改为首段，并登记剩余段。发送链上不再调用 LLM。 |
 | `send_service.after_send` | `OBSERVE` | 首段发送成功后快速创建后台补发任务。 |
@@ -161,7 +161,7 @@ seg1 已由原链发送
 
 ## 8. 超时与失败语义
 
-- `maisaka.replyer.after_response` 的 handler 超时为 25 秒。首次分段请求超过 6 秒时并发重试同一已配置模型，两个请求共用 20 秒内部总预算；任一请求先返回有效结果即采用并取消另一个，全部失败或超时才保留原文。
+- `maisaka.replyer.after_response` 的 handler 超时为 45 秒。首次分段请求超过 6 秒时并发重试同一已配置模型，两个请求共用 40 秒内部总预算；任一请求先返回有效结果即采用并取消另一个，全部失败或超时才保留原文。
 - `send_service.after_send` 只创建后台任务，不承担完整打字等待；`maisaka.planner.before_request` 负责等待同流补发完成。
 - 某个后续段发送失败时停止发送剩余段并记录具体段号，不伪装成功。
 - 插件卸载时取消并 drain 仍在运行的补发任务，避免 Task 泄漏。

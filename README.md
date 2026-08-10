@@ -129,7 +129,7 @@ typing_speed = 1.0
 
 ## 工作流程
 
-1. 在 `maisaka.replyer.after_response` 阶段调用分段 LLM，解析并规范化模型返回的 JSON 数组。首个请求超过 6 秒时会并发重试同一模型，内部总预算 20 秒；该 Hook 最多等待 25 秒，失败则保留原文
+1. 在 `maisaka.replyer.after_response` 阶段调用分段 LLM，解析并规范化模型返回的 JSON 数组。首个请求超过 6 秒时会并发重试同一模型，内部总预算 40 秒；该 Hook 最多等待 45 秒，失败则保留原文
 2. 将有效结果登记到 `(stream_id, 归一化文本 hash) -> [分段]` 的进程内缓存（默认 60 秒 TTL）
 3. 在 `send_service.after_build_message` 阶段消费缓存：原发送链只发送首段，剩余分段进入待补发登记；未命中缓存时直接放行，不在发送链上再次调用 LLM
 4. `send_service.after_send` 以 `OBSERVE` 模式快速创建后台任务，后续段通过 `ctx.send.text(..., typing=typing_enabled, sync_to_maisaka_history=True)` 顺序发送
