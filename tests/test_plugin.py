@@ -4,6 +4,7 @@ import random
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 _plugin_path = Path(__file__).resolve().parents[1] / "plugin.py"
@@ -21,6 +22,8 @@ from smart_segmentation_plugin import (  # noqa: E402
     SmartSegmentationPlugin,
     _extract_json_array_text,
     _extract_plain_text_outbound_message,
+    _coerce_bool,
+    _normalize_openai_base_url,
     _get_command_stream_grace_remaining,
     _has_unbalanced_brackets,
     _hash_normalized_text,
@@ -52,6 +55,24 @@ def _reset_global_state() -> None:
     plugin_module._planner_follow_up_entries_by_stream.clear()
 
 
+def test_config_schema_declares_custom_provider_fields() -> None:
+    fields = SegmentationSectionConfig.model_fields
+
+    assert fields["custom_provider_enabled"].default is False
+    assert fields["provider_type"].default == "newapi_channel_conn"
+    assert fields["api_url"].default == ""
+    assert fields["api_key"].default == ""
+    assert fields["min_length"].default == 3
+    assert fields["max_segments"].default == 16
+
+
+def test_config_boolean_and_provider_validation_are_strict() -> None:
+    assert _coerce_bool("false", True) is False
+    assert _coerce_bool("true", False) is True
+    assert _normalize_openai_base_url("https://api.wenxi.dev") == "https://api.wenxi.dev/v1"
+    assert _normalize_openai_base_url("https://api.wenxi.dev/v1/") == "https://api.wenxi.dev/v1"
+    assert _normalize_openai_base_url("https://api.wenxi.dev/api/v1") == "https://api.wenxi.dev/api/v1"
+
 def test_config_schema_uses_user_facing_webui_copy() -> None:
     assert PluginSectionConfig.__ui_label__ == "基础设置"
     assert SegmentationSectionConfig.__ui_label__ == "智能分段"
@@ -61,7 +82,7 @@ def test_config_schema_uses_user_facing_webui_copy() -> None:
     assert plugin_fields["config_version"].default == "1.2.0"
     assert "保持默认值" in plugin_fields["name"].description
     assert "true 开启，false 关闭" in plugin_fields["enabled"].description
-    assert "留空使用默认模型" in segmentation_fields["model"].description
+    assert "插件专用连接下填写模型名" in segmentation_fields["model"].description
     assert "填写正整数" in segmentation_fields["min_length"].description
     assert "填写正整数" in segmentation_fields["max_segments"].description
     assert "true 开启，false 关闭" in segmentation_fields["typing_enabled"].description
@@ -156,6 +177,10 @@ def test_runtime_settings_use_one_config_snapshot_and_respect_configured_segment
                 "temperature": "0.4",
                 "max_tokens": "700",
                 "typing_enabled": False,
+                "custom_provider_enabled": True,
+                "provider_type": "newapi_channel_conn",
+                "api_url": "https://api.wenxi.dev",
+                "api_key": "test-key",
                 "delay_base": 99,
             },
         }
@@ -172,9 +197,154 @@ def test_runtime_settings_use_one_config_snapshot_and_respect_configured_segment
         "max_tokens": 700,
         "style": "active",
         "model_name": "utils",
+        "custom_provider_enabled": True,
+        "provider_type": "newapi_channel_conn",
+        "api_url": "https://api.wenxi.dev",
+        "api_key": "test-key",
+        "custom_provider_valid": True,
         "typing_enabled": False,
     }
     assert mock_ctx.config.get_all.await_count == 1
+
+
+def test_custom_provider_settings_are_incomplete_when_required_value_is_missing() -> None:
+    plugin = SmartSegmentationPlugin()
+    mock_ctx = MagicMock()
+    mock_ctx.config.get_all = AsyncMock(
+        return_value={
+            "plugin": {"enabled": True},
+            "segmentation": {
+                "enabled": True,
+                "model": "fast",
+                "custom_provider_enabled": "false",
+                "provider_type": "unsupported",
+                "api_url": "https://api.wenxi.dev",
+                "api_key": "test-key",
+            },
+        }
+    )
+    plugin._ctx = mock_ctx
+
+    with patch.object(plugin, "_load_local_config_fallback", return_value={}):
+        settings = asyncio.run(plugin._get_segmentation_runtime_settings())
+
+    assert settings is not None
+    assert settings["custom_provider_enabled"] is False
+    assert settings["custom_provider_valid"] is False
+
+
+def test_custom_provider_calls_openai_compatible_endpoint_and_closes_client() -> None:
+    plugin = SmartSegmentationPlugin()
+    completion = SimpleNamespace(
+        model="gemma-4-31b",
+        choices=[SimpleNamespace(message=SimpleNamespace(content='["你好"]'))],
+        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+    )
+    create = AsyncMock(return_value=completion)
+    close = AsyncMock()
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=close,
+    )
+
+    with patch.object(plugin_module, "AsyncOpenAI", return_value=client) as openai_cls:
+        result = asyncio.run(
+            plugin._generate_with_pinned_model(
+                "按聊天节奏分段",
+                resolved_model_name="fast",
+                provider_type="newapi_channel_conn",
+                api_url="https://api.wenxi.dev",
+                api_key="test-key",
+                temperature=0.4,
+                max_tokens=256,
+                request_type="plugin.smart_segmentation.segment",
+            )
+        )
+
+    openai_cls.assert_called_once_with(
+        api_key="test-key",
+        base_url="https://api.wenxi.dev/v1",
+        timeout=plugin_module._CUSTOM_PROVIDER_TIMEOUT_SECONDS,
+    )
+    create.assert_awaited_once_with(
+        model="fast",
+        messages=[{"role": "user", "content": "按聊天节奏分段"}],
+        temperature=0.4,
+        max_tokens=256,
+    )
+    close.assert_awaited_once_with()
+    assert result["model_name"] == "gemma-4-31b"
+    assert result["response"] == '["你好"]'
+    assert result["total_tokens"] == 18
+
+
+def test_custom_provider_closes_client_when_request_fails() -> None:
+    plugin = SmartSegmentationPlugin()
+    create = AsyncMock(side_effect=RuntimeError("request failed"))
+    close = AsyncMock()
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=close,
+    )
+
+    with patch.object(plugin_module, "AsyncOpenAI", return_value=client):
+        try:
+            asyncio.run(
+                plugin._generate_with_pinned_model(
+                    "测试",
+                    resolved_model_name="fast",
+                    provider_type="newapi_channel_conn",
+                    api_url="https://api.wenxi.dev/v1",
+                    api_key="test-key",
+                    temperature=0.4,
+                    max_tokens=256,
+                    request_type="plugin.smart_segmentation.segment",
+                )
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "request failed"
+        else:
+            raise AssertionError("请求异常应向上抛出")
+
+    close.assert_awaited_once_with()
+
+
+def test_custom_provider_segmentation_skips_host_model_resolution_and_generation() -> None:
+    plugin = SmartSegmentationPlugin()
+    plugin._ctx = MagicMock()
+    plugin.ctx.llm.generate = AsyncMock(side_effect=AssertionError("不应调用宿主生成器"))
+    pinned_generate = AsyncMock(return_value={
+        "success": True,
+        "response": '["你好"]',
+        "reasoning": "",
+        "model_name": "gemma-4-31b",
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    })
+
+    with (
+        patch.object(plugin, "_resolve_generation_model", new=AsyncMock(side_effect=AssertionError("不应解析宿主模型"))) as resolve_model,
+        patch.object(plugin, "_generate_with_pinned_model", new=pinned_generate),
+    ):
+        result = asyncio.run(
+            plugin._segment_text(
+                "你好",
+                style="natural",
+                model_name="fast",
+                max_segments=4,
+                temperature=0.4,
+                max_tokens=256,
+                custom_provider_valid=True,
+                provider_type="newapi_channel_conn",
+                api_url="https://api.wenxi.dev",
+                api_key="test-key",
+            )
+        )
+
+    resolve_model.assert_not_awaited()
+    pinned_generate.assert_awaited_once()
+    assert result == ["你好"]
 
 
 def test_runtime_settings_enable_typing_by_default() -> None:

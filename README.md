@@ -44,7 +44,11 @@ enabled = true
 
 [segmentation]
 enabled = true
-model = "doubao1.6"
+model = "fast"
+custom_provider_enabled = false
+provider_type = "newapi_channel_conn"
+api_url = ""
+api_key = ""
 style = "natural"
 min_length = 8
 max_segments = 8
@@ -62,9 +66,9 @@ typing_speed = 1.0
 
 ### 3. 准备模型
 
-推荐使用响应快、价格低的小模型，例如 `gpt-4o-mini`、`qwen-plus`、`deepseek` 一类。这个任务只做文本切分，通常不需要大模型。
+启用插件专用第三方连接时，`[segmentation]` 中的 `model` 直接填写第三方模型名，例如 `fast`。默认配置关闭此连接；在 MaiBot WebUI 或本机未提交的运行时配置中填写 `custom_provider_enabled = true`、`api_url` 与 `api_key` 后才会启用。插件只会把这套连接用于智能分段；连接未启用或配置不完整时，回退到宿主 `model_config.toml` 的模型解析逻辑。API Key 不得提交到 Git 仓库。
 
-`model` 的解析顺序可以理解为：
+`model` 的宿主回退解析顺序可以理解为：
 
 1. 直接写 task 名，例如 `utils`
 2. 直接写宿主 `model_config.toml` 里的 `[[models]].name`
@@ -77,7 +81,11 @@ typing_speed = 1.0
 | --- | --- | --- |
 | `plugin.enabled` | 插件总开关 | `true` |
 | `segmentation.enabled` | 智能分段开关 | `true` |
-| `segmentation.model` | 分段所用模型，可填 task 名、模型名或模型标识 | 小模型即可 |
+| `segmentation.model` | 插件专用连接下的第三方模型名；宿主回退时可填 task 名、模型名或模型标识 | `fast` |
+| `segmentation.custom_provider_enabled` | 是否启用插件专用第三方连接 | `true` |
+| `segmentation.provider_type` | 插件专用连接类型 | `newapi_channel_conn` |
+| `segmentation.api_url` | 插件专用连接 API 地址 | `https://api.wenxi.dev` |
+| `segmentation.api_key` | 插件专用连接 API 密钥 | 本地填写，不入公开仓库 |
 | `segmentation.style` | 切分风格：`natural` / `conservative` / `active` | `natural` |
 | `segmentation.min_length` | 文本长度低于该值时不切分 | `8` 起步 |
 | `segmentation.max_segments` | 单次回复最大切分段数，以 `config.toml` 配置为准 | `8`–`16` |

@@ -13,8 +13,14 @@ import re
 import time
 import tomllib
 import unicodedata
+from urllib.parse import urlparse
+
+
+_SUPPORTED_CUSTOM_PROVIDER_TYPES = frozenset({"newapi_channel_conn"})
+_CUSTOM_PROVIDER_TIMEOUT_SECONDS = 35.0
 
 from maibot_sdk import Command, MaiBotPlugin
+from openai import AsyncOpenAI
 from src.config.model_configs import TaskConfig
 from src.llm_models.utils_model import LLMOrchestrator
 
@@ -166,19 +172,35 @@ class SegmentationSectionConfig(PluginConfigBase):
         description="是否启用智能分段；true 开启，false 关闭",
     )
     model: str = Field(
+        default="fast",
+        description="分段使用的模型；插件专用连接下填写模型名，留空使用宿主默认模型",
+    )
+    custom_provider_enabled: bool = Field(
+        default=False,
+        description="是否使用插件专用模型连接；true 开启，false 回退宿主模型配置",
+    )
+    provider_type: str = Field(
+        default="newapi_channel_conn",
+        description="插件专用模型连接类型；默认使用 newapi_channel_conn",
+    )
+    api_url: str = Field(
         default="",
-        description="分段使用的模型；填写任务名、模型名或模型标识，留空使用默认模型",
+        description="插件专用模型连接的 API 地址",
+    )
+    api_key: str = Field(
+        default="",
+        description="插件专用模型连接的 API 密钥",
     )
     style: str = Field(
         default="natural",
         description="分段风格；填写 natural（自然）、conservative（少分段）或 active（多分段）",
     )
     min_length: int = Field(
-        default=15,
+        default=3,
         description="触发分段的最小回复长度；填写正整数，短于此长度的回复不分段",
     )
     max_segments: int = Field(
-        default=8,
+        default=16,
         description="单次回复的最大分段数；填写正整数",
     )
     temperature: float = Field(
@@ -318,6 +340,30 @@ def _get_nested_config_value(config_data: dict[str, Any], key: str, default: Any
             return default
         current = current[part]
     return current
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """解析配置中的布尔值，避免字符串 ``false`` 被当成真值。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized_value = value.strip().lower()
+        if normalized_value in {"true", "1", "yes", "on"}:
+            return True
+        if normalized_value in {"false", "0", "no", "off", ""}:
+            return False
+    return default
+
+
+def _normalize_openai_base_url(api_url: str) -> str:
+    """规范化 OpenAI-compatible base URL，保留已有 API 前缀。"""
+    normalized_url = str(api_url or "").strip().rstrip("/")
+    parsed_url = urlparse(normalized_url)
+    if not parsed_url.scheme or not parsed_url.netloc:
+        raise ValueError("插件专用模型连接 API 地址无效")
+    if parsed_url.path.rstrip("/").endswith("/v1"):
+        return normalized_url
+    return f"{normalized_url}/v1"
 
 
 def _strip_thinking_content(text: str) -> str:
@@ -1436,11 +1482,42 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         prompt: str,
         *,
         resolved_model_name: str,
+        provider_type: str = "",
+        api_url: str = "",
+        api_key: str = "",
         temperature: float,
         max_tokens: int,
         request_type: str,
     ) -> dict[str, Any]:
-        """像 nai_pic_plugin 一样，直接固定到底层模型执行生成。"""
+        """使用宿主编排器固定模型；自定义连接通过临时 OpenAI provider 调用。"""
+        if provider_type or api_url or api_key:
+            if provider_type not in _SUPPORTED_CUSTOM_PROVIDER_TYPES:
+                raise ValueError(f"不支持的插件专用连接类型: {provider_type}")
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=_normalize_openai_base_url(api_url),
+                timeout=_CUSTOM_PROVIDER_TIMEOUT_SECONDS,
+            )
+            try:
+                completion = await client.chat.completions.create(
+                    model=resolved_model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                message = completion.choices[0].message
+                return {
+                    "success": True,
+                    "response": str(message.content or ""),
+                    "reasoning": str(getattr(message, "reasoning_content", "") or ""),
+                    "model_name": str(completion.model or resolved_model_name),
+                    "prompt_tokens": int(getattr(completion.usage, "prompt_tokens", 0) or 0),
+                    "completion_tokens": int(getattr(completion.usage, "completion_tokens", 0) or 0),
+                    "total_tokens": int(getattr(completion.usage, "total_tokens", 0) or 0),
+                }
+            finally:
+                await client.close()
+
         orchestrator = _PinnedTaskLLMOrchestrator(
             TaskConfig(
                 model_list=[resolved_model_name],
@@ -1508,17 +1585,24 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         max_segments: int,
         temperature: float,
         max_tokens: int,
+        custom_provider_valid: bool = False,
+        provider_type: str = "",
+        api_url: str = "",
+        api_key: str = "",
     ) -> list[str] | None:
         """调用 LLM 对文本进行分段。"""
         prompt = self._build_segmentation_prompt(text, style, max_segments)
         # JSON 数组输出体积与原文同量级，长文时固定 max_tokens 会截断输出导致解析失败；
         # 按原文长度动态扩容，配置值只作为下限。
         effective_max_tokens = max(max_tokens, len(text) * 2 + 160)
-        try:
-            target_kind, target_name = await self._resolve_generation_model(model_name)
-        except Exception as exc:
-            logger.error("解析智能分段模型失败: %s", exc, exc_info=True)
-            return None
+        if custom_provider_valid:
+            target_kind, target_name = "custom", model_name.strip()
+        else:
+            try:
+                target_kind, target_name = await self._resolve_generation_model(model_name)
+            except Exception as exc:
+                logger.error("解析智能分段模型失败: %s", exc, exc_info=True)
+                return None
         logger.info(
             "智能分段开始调用 LLM: configured_model=%r resolved_kind=%r resolved_target=%r",
             model_name,
@@ -1527,7 +1611,18 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         )
 
         try:
-            if target_kind == "model" and target_name:
+            if custom_provider_valid:
+                raw_result = await self._generate_with_pinned_model(
+                    prompt,
+                    resolved_model_name=target_name,
+                    provider_type=provider_type,
+                    api_url=api_url,
+                    api_key=api_key,
+                    temperature=temperature,
+                    max_tokens=effective_max_tokens,
+                    request_type="plugin.smart_segmentation.segment",
+                )
+            elif target_kind == "model" and target_name:
                 raw_result = await self._generate_with_pinned_model(
                     prompt,
                     resolved_model_name=target_name,
@@ -1603,6 +1698,10 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         max_segments: int,
         temperature: float,
         max_tokens: int,
+        custom_provider_valid: bool = False,
+        provider_type: str = "",
+        api_url: str = "",
+        api_key: str = "",
     ) -> list[str] | None:
         """首个请求迟迟未返回时，并发重试同一个分段模型。"""
 
@@ -1614,6 +1713,10 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                 max_segments=max_segments,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                custom_provider_valid=custom_provider_valid,
+                provider_type=provider_type,
+                api_url=api_url,
+                api_key=api_key,
             )
 
         first_attempt = asyncio.create_task(_start_attempt())
@@ -1714,8 +1817,11 @@ class SmartSegmentationPlugin(MaiBotPlugin):
     async def _get_segmentation_runtime_settings(self) -> dict[str, Any] | None:
         """读取并规范化运行时所需的分段配置。"""
         plugin_config = await self._get_plugin_config()
-        plugin_enabled = bool(_get_nested_config_value(plugin_config, "plugin.enabled", True))
-        segmentation_enabled = bool(_get_nested_config_value(plugin_config, "segmentation.enabled", True))
+        plugin_enabled = _coerce_bool(_get_nested_config_value(plugin_config, "plugin.enabled", True), True)
+        segmentation_enabled = _coerce_bool(
+            _get_nested_config_value(plugin_config, "segmentation.enabled", True),
+            True,
+        )
         if not plugin_enabled or not segmentation_enabled or not _runtime_enabled:
             return None
 
@@ -1728,8 +1834,28 @@ class SmartSegmentationPlugin(MaiBotPlugin):
         temperature_raw = _get_nested_config_value(plugin_config, "segmentation.temperature", 0.3)
         max_tokens_raw = _get_nested_config_value(plugin_config, "segmentation.max_tokens", 600)
         style = str(_get_nested_config_value(plugin_config, "segmentation.style", "natural") or "natural")
-        model_name = str(_get_nested_config_value(plugin_config, "segmentation.model", "") or "")
-        typing_enabled = bool(_get_nested_config_value(plugin_config, "segmentation.typing_enabled", True))
+        model_name = str(_get_nested_config_value(plugin_config, "segmentation.model", "fast") or "")
+        custom_provider_enabled = _coerce_bool(
+            _get_nested_config_value(plugin_config, "segmentation.custom_provider_enabled", False),
+            False,
+        )
+        provider_type = str(
+            _get_nested_config_value(plugin_config, "segmentation.provider_type", "newapi_channel_conn")
+            or ""
+        ).strip()
+        api_url = str(_get_nested_config_value(plugin_config, "segmentation.api_url", "") or "").strip()
+        api_key = str(_get_nested_config_value(plugin_config, "segmentation.api_key", "") or "").strip()
+        custom_provider_valid = bool(
+            custom_provider_enabled
+            and model_name.strip()
+            and provider_type in _SUPPORTED_CUSTOM_PROVIDER_TYPES
+            and api_url
+            and api_key
+        )
+        typing_enabled = _coerce_bool(
+            _get_nested_config_value(plugin_config, "segmentation.typing_enabled", True),
+            True,
+        )
 
         try:
             min_length = int(min_length_raw)
@@ -1754,6 +1880,11 @@ class SmartSegmentationPlugin(MaiBotPlugin):
             "max_tokens": max_tokens,
             "style": style,
             "model_name": model_name,
+            "custom_provider_enabled": custom_provider_enabled,
+            "provider_type": provider_type,
+            "api_url": api_url,
+            "api_key": api_key,
+            "custom_provider_valid": custom_provider_valid,
             "typing_enabled": typing_enabled,
         }
 
@@ -1809,6 +1940,10 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                     max_segments=settings["max_segments"],
                     temperature=settings["temperature"],
                     max_tokens=settings["max_tokens"],
+                    custom_provider_valid=settings["custom_provider_valid"],
+                    provider_type=settings["provider_type"],
+                    api_url=settings["api_url"],
+                    api_key=settings["api_key"],
                 ),
                 timeout=_REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS,
             )

@@ -26,8 +26,20 @@ enabled = true
 # 是否启用智能分段；true 开启，false 关闭
 enabled = true
 
-# 分段使用的模型；填写任务名、模型名或模型标识，留空使用默认模型
-model = "doubao1.6"
+# 分段使用的模型；插件专用连接下填写模型名，留空使用宿主默认模型
+model = "fast"
+
+# 是否使用插件专用模型连接；false 时回退宿主 model_config.toml
+custom_provider_enabled = false
+
+# 插件专用模型连接类型
+provider_type = "newapi_channel_conn"
+
+# 插件专用模型连接 API 地址；启用自定义连接时填写
+api_url = ""
+
+# 插件专用模型连接 API 密钥；通过 WebUI 或运行时配置填写，不要提交真实值
+api_key = ""
 
 # 分段风格；填写 natural（自然）、conservative（少分段）或 active（多分段）
 style = "natural"

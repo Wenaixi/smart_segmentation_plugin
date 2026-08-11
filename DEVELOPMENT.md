@@ -187,7 +187,11 @@ seg1 已由原链发送
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 是否启用智能分段。 |
-| `model` | `""` | 分段模型；空值交给宿主默认解析。 |
+| `model` | `fast` | 插件专用连接下的第三方模型名；宿主回退时可填 task 名、模型名或模型标识。 |
+| `custom_provider_enabled` | `true` | 是否使用插件专用第三方连接；关闭后回退宿主模型配置。 |
+| `provider_type` | `newapi_channel_conn` | 插件专用连接类型。 |
+| `api_url` | `""` | 插件专用连接 API 地址。 |
+| `api_key` | `""` | 插件专用连接 API 密钥；不要写入公开仓库。 |
 | `style` | `natural` | `natural` / `conservative` / `active`。 |
 | `min_length` | `15` | 低于此字符数时不分段。 |
 | `max_segments` | `8` | 最大分段数；可在插件配置中自定义，运行时不设置额外上限。 |
