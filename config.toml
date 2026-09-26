@@ -26,8 +26,12 @@ enabled = true
 # 是否启用智能分段；true 开启，false 关闭
 enabled = true
 
-# 分段使用的模型；插件专用连接下填写模型名，留空使用宿主默认模型
-model = "fast"
+# 分段使用的模型任务名，需为宿主 model_config.toml 中 model_task_config
+# 下已存在的任务（utils / replyer / planner / vlm 等）。
+# 原值 "fast" 并非宿主已配置的任务或模型名，每次解析都会落空并触发
+# 「未命中宿主可用 task，将回退默认模型」告警；虽能靠兜底正常运行，
+# 但会持续刷日志。改为 utils 后命中第一级解析，实际行为与原先一致。
+model = "utils"
 
 # 是否使用插件专用模型连接；false 时回退宿主 model_config.toml
 custom_provider_enabled = false
