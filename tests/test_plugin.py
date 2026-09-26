@@ -1,29 +1,23 @@
 import asyncio
 import json
 import random
-import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-_plugin_path = Path(__file__).resolve().parents[1] / "plugin.py"
-_plugin_spec = importlib.util.spec_from_file_location("smart_segmentation_plugin", _plugin_path)
-if _plugin_spec is None or _plugin_spec.loader is None:
-    raise RuntimeError(f"无法加载插件模块: {_plugin_path}")
-plugin_module = importlib.util.module_from_spec(_plugin_spec)
-sys.modules[_plugin_spec.name] = plugin_module
-_plugin_spec.loader.exec_module(plugin_module)
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from smart_segmentation_plugin import (  # noqa: E402
+from src.llm_models.payload_content.context_item import ContextItemBuilder, RoleType
+from src.plugin_runtime.hook_payloads import deserialize_prompt_items, serialize_prompt_items
+
+from plugins.smart_segmentation_plugin import plugin as plugin_module
+from plugins.smart_segmentation_plugin.plugin import (
     _COMMAND_REPLY_GRACE_SECONDS,
     PluginSectionConfig,
     SegmentationSectionConfig,
     SmartSegmentationPlugin,
     _extract_json_array_text,
     _extract_plain_text_outbound_message,
-    _coerce_bool,
-    _normalize_openai_base_url,
     _get_command_stream_grace_remaining,
     _has_unbalanced_brackets,
     _hash_normalized_text,
@@ -55,24 +49,6 @@ def _reset_global_state() -> None:
     plugin_module._planner_follow_up_entries_by_stream.clear()
 
 
-def test_config_schema_declares_custom_provider_fields() -> None:
-    fields = SegmentationSectionConfig.model_fields
-
-    assert fields["custom_provider_enabled"].default is False
-    assert fields["provider_type"].default == "newapi_channel_conn"
-    assert fields["api_url"].default == ""
-    assert fields["api_key"].default == ""
-    assert fields["min_length"].default == 3
-    assert fields["max_segments"].default == 16
-
-
-def test_config_boolean_and_provider_validation_are_strict() -> None:
-    assert _coerce_bool("false", True) is False
-    assert _coerce_bool("true", False) is True
-    assert _normalize_openai_base_url("https://api.wenxi.dev") == "https://api.wenxi.dev/v1"
-    assert _normalize_openai_base_url("https://api.wenxi.dev/v1/") == "https://api.wenxi.dev/v1"
-    assert _normalize_openai_base_url("https://api.wenxi.dev/api/v1") == "https://api.wenxi.dev/api/v1"
-
 def test_config_schema_uses_user_facing_webui_copy() -> None:
     assert PluginSectionConfig.__ui_label__ == "基础设置"
     assert SegmentationSectionConfig.__ui_label__ == "智能分段"
@@ -82,7 +58,7 @@ def test_config_schema_uses_user_facing_webui_copy() -> None:
     assert plugin_fields["config_version"].default == "1.2.0"
     assert "保持默认值" in plugin_fields["name"].description
     assert "true 开启，false 关闭" in plugin_fields["enabled"].description
-    assert "插件专用连接下填写模型名" in segmentation_fields["model"].description
+    assert "留空使用默认模型" in segmentation_fields["model"].description
     assert "填写正整数" in segmentation_fields["min_length"].description
     assert "填写正整数" in segmentation_fields["max_segments"].description
     assert "true 开启，false 关闭" in segmentation_fields["typing_enabled"].description
@@ -150,16 +126,20 @@ def test_get_components_registers_hook_handlers_for_current_host() -> None:
     assert hook_components["smart_segmentation_command_scope_enter"]["metadata"]["hook"] == "chat.command.before_execute"
     assert "smart_segmentation_command_scope_leave" in hook_components
     assert hook_components["smart_segmentation_command_scope_leave"]["metadata"]["hook"] == "chat.command.after_execute"
+    # 早期路径是唯一的分段入口；没有这个 hook，发送链上的缓存查找永远 miss，插件等于失效。
     assert "smart_segmentation_after_replyer_response" in hook_components
     assert (
         hook_components["smart_segmentation_after_replyer_response"]["metadata"]["hook"]
         == "maisaka.replyer.after_response"
     )
     replyer_hook_timeout_ms = hook_components["smart_segmentation_after_replyer_response"]["metadata"]["timeout_ms"]
-    assert replyer_hook_timeout_ms == 45_000
+    assert replyer_hook_timeout_ms == 25_000
     assert replyer_hook_timeout_ms > plugin_module._REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS * 1000
-    assert plugin_module._REPLYER_PREPARED_SEGMENT_TIMEOUT_SECONDS == 40.0
-    assert "smart_segmentation_preserve_prepared_response" not in hook_components
+    assert "smart_segmentation_preserve_prepared_response" in hook_components
+    assert (
+        hook_components["smart_segmentation_preserve_prepared_response"]["metadata"]["hook"]
+        == "maisaka.reply.before_post_process"
+    )
 
 
 def test_runtime_settings_use_one_config_snapshot_and_respect_configured_segment_count() -> None:
@@ -177,10 +157,6 @@ def test_runtime_settings_use_one_config_snapshot_and_respect_configured_segment
                 "temperature": "0.4",
                 "max_tokens": "700",
                 "typing_enabled": False,
-                "custom_provider_enabled": True,
-                "provider_type": "newapi_channel_conn",
-                "api_url": "https://api.wenxi.dev",
-                "api_key": "test-key",
                 "delay_base": 99,
             },
         }
@@ -197,154 +173,9 @@ def test_runtime_settings_use_one_config_snapshot_and_respect_configured_segment
         "max_tokens": 700,
         "style": "active",
         "model_name": "utils",
-        "custom_provider_enabled": True,
-        "provider_type": "newapi_channel_conn",
-        "api_url": "https://api.wenxi.dev",
-        "api_key": "test-key",
-        "custom_provider_valid": True,
         "typing_enabled": False,
     }
     assert mock_ctx.config.get_all.await_count == 1
-
-
-def test_custom_provider_settings_are_incomplete_when_required_value_is_missing() -> None:
-    plugin = SmartSegmentationPlugin()
-    mock_ctx = MagicMock()
-    mock_ctx.config.get_all = AsyncMock(
-        return_value={
-            "plugin": {"enabled": True},
-            "segmentation": {
-                "enabled": True,
-                "model": "fast",
-                "custom_provider_enabled": "false",
-                "provider_type": "unsupported",
-                "api_url": "https://api.wenxi.dev",
-                "api_key": "test-key",
-            },
-        }
-    )
-    plugin._ctx = mock_ctx
-
-    with patch.object(plugin, "_load_local_config_fallback", return_value={}):
-        settings = asyncio.run(plugin._get_segmentation_runtime_settings())
-
-    assert settings is not None
-    assert settings["custom_provider_enabled"] is False
-    assert settings["custom_provider_valid"] is False
-
-
-def test_custom_provider_calls_openai_compatible_endpoint_and_closes_client() -> None:
-    plugin = SmartSegmentationPlugin()
-    completion = SimpleNamespace(
-        model="gemma-4-31b",
-        choices=[SimpleNamespace(message=SimpleNamespace(content='["你好"]'))],
-        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
-    )
-    create = AsyncMock(return_value=completion)
-    close = AsyncMock()
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
-        close=close,
-    )
-
-    with patch.object(plugin_module, "AsyncOpenAI", return_value=client) as openai_cls:
-        result = asyncio.run(
-            plugin._generate_with_pinned_model(
-                "按聊天节奏分段",
-                resolved_model_name="fast",
-                provider_type="newapi_channel_conn",
-                api_url="https://api.wenxi.dev",
-                api_key="test-key",
-                temperature=0.4,
-                max_tokens=256,
-                request_type="plugin.smart_segmentation.segment",
-            )
-        )
-
-    openai_cls.assert_called_once_with(
-        api_key="test-key",
-        base_url="https://api.wenxi.dev/v1",
-        timeout=plugin_module._CUSTOM_PROVIDER_TIMEOUT_SECONDS,
-    )
-    create.assert_awaited_once_with(
-        model="fast",
-        messages=[{"role": "user", "content": "按聊天节奏分段"}],
-        temperature=0.4,
-        max_tokens=256,
-    )
-    close.assert_awaited_once_with()
-    assert result["model_name"] == "gemma-4-31b"
-    assert result["response"] == '["你好"]'
-    assert result["total_tokens"] == 18
-
-
-def test_custom_provider_closes_client_when_request_fails() -> None:
-    plugin = SmartSegmentationPlugin()
-    create = AsyncMock(side_effect=RuntimeError("request failed"))
-    close = AsyncMock()
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
-        close=close,
-    )
-
-    with patch.object(plugin_module, "AsyncOpenAI", return_value=client):
-        try:
-            asyncio.run(
-                plugin._generate_with_pinned_model(
-                    "测试",
-                    resolved_model_name="fast",
-                    provider_type="newapi_channel_conn",
-                    api_url="https://api.wenxi.dev/v1",
-                    api_key="test-key",
-                    temperature=0.4,
-                    max_tokens=256,
-                    request_type="plugin.smart_segmentation.segment",
-                )
-            )
-        except RuntimeError as exc:
-            assert str(exc) == "request failed"
-        else:
-            raise AssertionError("请求异常应向上抛出")
-
-    close.assert_awaited_once_with()
-
-
-def test_custom_provider_segmentation_skips_host_model_resolution_and_generation() -> None:
-    plugin = SmartSegmentationPlugin()
-    plugin._ctx = MagicMock()
-    plugin.ctx.llm.generate = AsyncMock(side_effect=AssertionError("不应调用宿主生成器"))
-    pinned_generate = AsyncMock(return_value={
-        "success": True,
-        "response": '["你好"]',
-        "reasoning": "",
-        "model_name": "gemma-4-31b",
-        "prompt_tokens": 1,
-        "completion_tokens": 1,
-        "total_tokens": 2,
-    })
-
-    with (
-        patch.object(plugin, "_resolve_generation_model", new=AsyncMock(side_effect=AssertionError("不应解析宿主模型"))) as resolve_model,
-        patch.object(plugin, "_generate_with_pinned_model", new=pinned_generate),
-    ):
-        result = asyncio.run(
-            plugin._segment_text(
-                "你好",
-                style="natural",
-                model_name="fast",
-                max_segments=4,
-                temperature=0.4,
-                max_tokens=256,
-                custom_provider_valid=True,
-                provider_type="newapi_channel_conn",
-                api_url="https://api.wenxi.dev",
-                api_key="test-key",
-            )
-        )
-
-    resolve_model.assert_not_awaited()
-    pinned_generate.assert_awaited_once()
-    assert result == ["你好"]
 
 
 def test_runtime_settings_enable_typing_by_default() -> None:
@@ -913,18 +744,18 @@ def test_planner_before_request_waits_for_follow_ups_and_repairs_built_prompt() 
                 processed_plain_text=response_text,
             )
             first_message = build_result["modified_kwargs"]["message"]
-            planner_messages = [
-                {"role": "tool", "content": "工具结果声称三段均已发送"},
-                {
-                    "role": "user",
-                    "content": '<message msg_id="first" user="bot" is_self_message="true">\n行啊',
-                },
-                {"role": "user", "content": "时间：2026-07-26 23:45:52"},
-            ]
+            planner_source_items = (
+                ContextItemBuilder()
+                .set_role(RoleType.User)
+                .add_text_content('<message msg_id="first" user="bot" is_self_message="true">\n行啊')
+                .build(),
+                ContextItemBuilder().set_role(RoleType.User).add_text_content("时间：2026-07-26 23:45:52").build(),
+            )
+            planner_messages = serialize_prompt_items(planner_source_items)
 
             planner_task = asyncio.create_task(
                 plugin.handle_maisaka_planner_before_request(
-                    messages=planner_messages,
+                    items=planner_messages,
                     tool_definitions=[{"type": "function"}],
                     selected_history_count=2,
                     built_message_count=3,
@@ -943,7 +774,9 @@ def test_planner_before_request_waits_for_follow_ups_and_repairs_built_prompt() 
             planner_result = await asyncio.wait_for(planner_task, timeout=0.2)
 
         modified = planner_result["modified_kwargs"]
-        assert modified["messages"][1]["content"].endswith("\n" + "\n".join(segments))
+        assert modified["items"][0]["parts"][0]["text"].endswith("\n" + "\n".join(segments))
+        restored_items = deserialize_prompt_items(modified["items"], original_items=planner_source_items)
+        assert restored_items[0].parts[0].text.endswith("\n" + "\n".join(segments))
         assert modified["tool_definitions"] == [{"type": "function"}]
         assert modified["selected_history_count"] == 2
         assert modified["built_message_count"] == 3
@@ -1003,7 +836,7 @@ def test_planner_releases_quickly_when_first_send_never_reaches_after_send() -> 
         ):
             result = await asyncio.wait_for(
                 plugin.handle_maisaka_planner_before_request(
-                    messages=[],
+                    items=[],
                     session_id="stream-first-send-failed",
                 ),
                 timeout=0.1,
