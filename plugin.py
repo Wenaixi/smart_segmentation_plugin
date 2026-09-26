@@ -1631,12 +1631,22 @@ class SmartSegmentationPlugin(MaiBotPlugin):
                     request_type="plugin.smart_segmentation.segment",
                 )
             else:
-                raw_result = await self.ctx.llm.generate(
-                    prompt=prompt,
-                    model=target_name,
-                    temperature=temperature,
-                    max_tokens=effective_max_tokens,
-                )
+                # 宿主 1.2.5 起把任务名与具体模型名彻底分离：任务名只能经 task_name 传递，
+                # 写进 model 会被解析成具体模型名，报「未找到名为 'x' 的模型」。
+                # model_name 仅在解析结果确实是具体模型名时使用，此处为防御性兜底
+                # （正常情况下该 kind 已被上面的固定模型分支拦截）。
+                llm_kwargs: dict[str, Any] = {
+                    "prompt": prompt,
+                    "temperature": temperature,
+                    "max_tokens": effective_max_tokens,
+                }
+                if target_kind == "model" and target_name:
+                    llm_kwargs["model_name"] = target_name
+                elif target_name:
+                    llm_kwargs["task_name"] = target_name
+                # target_name 为空表示回退默认模型：两个键都不传，由 SDK 走默认 utils 任务；
+                # 显式传 None 会在宿主侧触发异常，因此必须整键省略而不是传空值。
+                raw_result = await self.ctx.llm.generate(**llm_kwargs)
         except Exception as exc:
             logger.error("智能分段 LLM 调用失败: %s", exc, exc_info=True)
             return None
