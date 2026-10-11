@@ -1,5 +1,13 @@
 # saberlights smart-segmentation-plugin
 
+## 官方上游与版本溯源
+- 官方仓库（Upstream Repository）：https://github.com/saberlights/smart_segmentation_plugin
+- 官方作者（Author / Maintainer）：saberlights
+- 功能定位：智能消息断句与长文本拟人化分段发送插件
+- 本地演进定位：基于官方上游最新版本，融入本地生产环境兼容性定制与稳定性加固。
+- 本地专属定制：本地将非法模型名 fast 纠正为合法任务名 utils，消除每分钟百次日志噪音。
+
+
 ## 插件基本信息
 
 - 插件 ID：`saberlights.smart-segmentation-plugin`
